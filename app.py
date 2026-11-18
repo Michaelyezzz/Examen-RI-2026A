@@ -162,3 +162,124 @@ class InvertedIndex:
         if tid is None:
             return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
         return self.postings[tid]
+
+
+# -----------------------------------------------------------------------------
+# 3) Modelos de recuperación: TF-IDF (coseno) y BM25
+# -----------------------------------------------------------------------------
+import math
+
+class SearchEngine:
+    """Motor de búsqueda term-at-a-time sobre un InvertedIndex.
+
+    Para cada término de la consulta se recorren SOLO sus postings y se suman
+    las contribuciones en un acumulador numpy de tamaño N; los candidatos son
+    los documentos con acumulador > 0 (nunca se itera documento a documento).
+    """
+
+    MODELS = ("tfidf", "bm25")
+
+    def __init__(self, index, k1=1.5, b=0.75, snippet_len=300):
+        self.index = index
+        self.k1, self.b, self.snippet_len = float(k1), float(b), int(snippet_len)
+        N = index.N
+        df = index.df.astype(np.float64)
+
+        # idf de cada modelo, indexado por term_id
+        self.idf_tfidf = np.log(N / df)                               # log(N/df)
+        self.idf_bm25 = np.log(1.0 + (N - df + 0.5) / (df + 0.5))     # siempre > 0
+
+        # Norma L2 de cada vector de documento TF-IDF (precalculada una vez).
+        # En cada lista de postings un doc aparece una sola vez -> += es seguro.
+        norm_sq = np.zeros(N, dtype=np.float64)
+        for tid, (doc_idx, tf) in index.postings.items():
+            w = (1.0 + np.log(tf)) * self.idf_tfidf[tid]
+            norm_sq[doc_idx] += w * w
+        self.doc_norm = np.sqrt(norm_sq)
+
+        # Parte del denominador de BM25 que solo depende del documento
+        self.bm25_len_norm = self.k1 * (1.0 - self.b + self.b * index.doc_len / index.avgdl)
+
+    # ---------------------------------------------------------------- scoring
+    def _query_terms(self, query):
+        """Términos de la consulta presentes en el vocabulario -> Counter(term_id)."""
+        vocab = self.index.vocab
+        return Counter(vocab[t] for t in preprocess(query) if t in vocab)
+
+    def _acc_tfidf(self, qtf):
+        acc = np.zeros(self.index.N, dtype=np.float64)
+        # Vector de consulta con el mismo esquema (1+log tf)*idf
+        qw = {tid: (1.0 + math.log(c)) * self.idf_tfidf[tid] for tid, c in qtf.items()}
+        qnorm = math.sqrt(sum(w * w for w in qw.values()))
+        if qnorm == 0.0:                 # solo términos con df = N (idf = 0)
+            return acc
+        for tid, w_q in qw.items():
+            doc_idx, tf = self.index.postings[tid]
+            acc[doc_idx] += w_q * (1.0 + np.log(tf)) * self.idf_tfidf[tid]
+        # coseno = producto escalar / (|q| |d|); docs con norma 0 se quedan en 0
+        np.divide(acc, self.doc_norm * qnorm, out=acc, where=self.doc_norm > 0)
+        return acc
+
+    def _acc_bm25(self, qtf):
+        acc = np.zeros(self.index.N, dtype=np.float64)
+        for tid in qtf:                  # cada término distinto de la consulta, una vez
+            doc_idx, tf = self.index.postings[tid]
+            tf = tf.astype(np.float64)
+            acc[doc_idx] += self.idf_bm25[tid] * tf * (self.k1 + 1.0) / (
+                tf + self.bm25_len_norm[doc_idx])
+        return acc
+
+    def scores(self, query, model="bm25"):
+        """Vector denso (N,) con la puntuación de cada documento (para pruebas)."""
+        model = self._check_model(model)
+        qtf = self._query_terms(query)
+        if not qtf:
+            return np.zeros(self.index.N, dtype=np.float64)
+        return self._acc_tfidf(qtf) if model == "tfidf" else self._acc_bm25(qtf)
+
+    def _check_model(self, model):
+        model = str(model).lower().strip()
+        if model not in self.MODELS:
+            raise ValueError(f"model debe ser uno de {self.MODELS}, no {model!r}")
+        return model
+
+    # ----------------------------------------------------------------- search
+    def _snippet(self, doc_idx):
+        """≈ primeros snippet_len caracteres del texto, cortando en un espacio."""
+        text = self.index.texts[doc_idx] or self.index.titles[doc_idx]
+        if len(text) <= self.snippet_len:
+            return text
+        cut = text.rfind(" ", 0, self.snippet_len)
+        return text[: cut if cut > 0 else self.snippet_len].rstrip() + "..."
+
+    def search(self, query, model="bm25", top_k=10):
+        """Devuelve los top_k documentos con score > 0, de mayor a menor score.
+
+        Desempate determinista: a igual score, menor doc_idx (orden del corpus).
+        Consulta vacía, solo stopwords o términos desconocidos -> [].
+        """
+        model = self._check_model(model)
+        top_k = int(top_k)
+        if top_k < 1:
+            return []
+        acc = self.scores(query, model)
+        cand = np.flatnonzero(acc > 0)               # solo docs tocados por postings
+        if cand.size == 0:
+            return []
+        s = acc[cand]
+        if cand.size > top_k:
+            # Umbral = k-ésimo mayor score; se conservan TODOS los empatados con él
+            kth = s[np.argpartition(-s, top_k - 1)[top_k - 1]]
+            keep = s >= kth
+            cand, s = cand[keep], s[keep]
+        order = np.lexsort((cand, -s))[:top_k]        # clave 1: -score, clave 2: doc_idx
+        return [
+            {
+                "rank": r,
+                "document_id": self.index.doc_ids[i],
+                "score": float(acc[i]),
+                "title": self.index.titles[i],
+                "snippet": self._snippet(i),
+            }
+            for r, i in enumerate(cand[order].tolist(), start=1)
+        ]
