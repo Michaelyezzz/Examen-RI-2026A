@@ -1,0 +1,118 @@
+{
+  "info": {
+    "name": "SciFact IR - TF-IDF y BM25",
+    "description": "Pruebas del servicio de recuperación sobre BeIR/scifact. Cambiar la variable base_url por la URL pública del Space.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://USUARIO-scifact-ir.hf.space", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "GET /health",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('status ok y 5183 documentos', () => {",
+              "  const b = pm.response.json();",
+              "  pm.expect(b.status).to.eql('ok');",
+              "  pm.expect(b.documents).to.eql(5183);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /search (bm25)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Vitamin D deficiency is linked to multiple sclerosis\",\n  \"model\": \"bm25\",\n  \"top_k\": 10\n}"
+        },
+        "url": "{{base_url}}/search"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('formato, orden, sin duplicados, top_k', () => {",
+              "  const b = pm.response.json();",
+              "  pm.expect(b.model).to.eql('bm25');",
+              "  pm.expect(b.results.length).to.be.at.most(10);",
+              "  const s = b.results.map(r => r.score);",
+              "  for (let i = 1; i < s.length; i++) pm.expect(s[i - 1]).to.be.at.least(s[i]);",
+              "  const ids = b.results.map(r => r.document_id);",
+              "  pm.expect(new Set(ids).size).to.eql(ids.length);",
+              "  b.results.forEach(r => pm.expect(r).to.have.all.keys('rank', 'document_id', 'score', 'title', 'snippet'));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /search (tfidf)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"aspirin lowers colorectal cancer incidence\",\n  \"model\": \"tfidf\",\n  \"top_k\": 5\n}"
+        },
+        "url": "{{base_url}}/search"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('formato, orden, sin duplicados, top_k', () => {",
+              "  const b = pm.response.json();",
+              "  pm.expect(b.model).to.eql('tfidf');",
+              "  pm.expect(b.results.length).to.be.at.most(5);",
+              "  const s = b.results.map(r => r.score);",
+              "  for (let i = 1; i < s.length; i++) pm.expect(s[i - 1]).to.be.at.least(s[i]);",
+              "  const ids = b.results.map(r => r.document_id);",
+              "  pm.expect(new Set(ids).size).to.eql(ids.length);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /search (query vacía -> 422)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"query\": \"   \",\n  \"model\": \"bm25\"\n}" },
+        "url": "{{base_url}}/search"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('status 422', () => pm.response.to.have.status(422));"]
+          }
+        }
+      ]
+    }
+  ]
+}
