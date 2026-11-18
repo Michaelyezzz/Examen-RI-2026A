@@ -283,3 +283,109 @@ class SearchEngine:
             }
             for r, i in enumerate(cand[order].tolist(), start=1)
         ]
+
+
+# -----------------------------------------------------------------------------
+# 4) Servicio web (FastAPI, solo JSON)
+#    Arranque:  uvicorn app:app --host 0.0.0.0 --port 8000
+# -----------------------------------------------------------------------------
+import os
+import time
+from contextlib import asynccontextmanager
+from typing import List, Literal
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, field_validator
+
+CORPUS_PATH = os.environ.get(
+    "CORPUS_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus.jsonl"))
+MAX_QUERY_CHARS = 1000
+MAX_TOP_K = 100
+
+STATE = {}     # se rellena en el arranque: index, engine, tiempo de carga
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    """Al arrancar: lee corpus.jsonl y construye índice + motor (una sola vez)."""
+    t0 = time.perf_counter()
+    index = InvertedIndex().build(load_corpus(CORPUS_PATH))
+    STATE["index"] = index
+    STATE["engine"] = SearchEngine(index)
+    STATE["startup_seconds"] = round(time.perf_counter() - t0, 2)
+    print(f"[app] Índice listo: {index.N} documentos, {len(index.vocab)} términos "
+          f"en {STATE['startup_seconds']} s", flush=True)
+    yield
+    STATE.clear()
+
+
+class SearchRequest(BaseModel):
+    """Cuerpo de POST /search."""
+    query: str = Field(..., description="Texto libre de la consulta (no vacío, máx. 1000 caracteres)")
+    model: str = Field("bm25", description="'bm25' o 'tfidf' (sin distinguir mayúsculas)")
+    top_k: int = Field(10, ge=1, le=MAX_TOP_K, description="Número de resultados, 1..100")
+
+    @field_validator("query")
+    @classmethod
+    def _query_ok(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("query no puede estar vacía")
+        if len(v) > MAX_QUERY_CHARS:
+            raise ValueError(f"query no puede superar {MAX_QUERY_CHARS} caracteres")
+        return v
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def _model_ok(cls, v):
+        if not isinstance(v, str):
+            raise ValueError("model debe ser una cadena: 'bm25' o 'tfidf'")
+        v = v.strip().lower()
+        if v not in SearchEngine.MODELS:
+            raise ValueError("model debe ser 'bm25' o 'tfidf'")
+        return v
+
+
+class SearchResult(BaseModel):
+    rank: int
+    document_id: str
+    score: float
+    title: str
+    snippet: str
+
+
+class SearchResponse(BaseModel):
+    model: Literal["bm25", "tfidf"]
+    results: List[SearchResult]
+
+
+# Sin /docs ni /redoc (páginas HTML): el servicio es solo JSON.
+app = FastAPI(
+    title="SciFact IR - TF-IDF y BM25",
+    description="Recuperación léxica sobre BeIR/scifact. Solo JSON.",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
+
+
+@app.get("/")
+def root():
+    """Descripción mínima del servicio (JSON)."""
+    return {"service": "SciFact IR (TF-IDF coseno y BM25)",
+            "endpoints": {"GET /health": "disponibilidad",
+                          "POST /search": {"query": "str", "model": "bm25 | tfidf",
+                                           "top_k": "int 1..100"}}}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "documents": STATE["index"].N, "models": ["bm25", "tfidf"]}
+
+
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest):
+    # Consulta sin términos útiles (p. ej. solo stopwords) -> 200 con results []
+    results = STATE["engine"].search(req.query, req.model, req.top_k)
+    return {"model": req.model, "results": results}
